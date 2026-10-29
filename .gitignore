@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+data/
+anime_sinhala_bot_data/

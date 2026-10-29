@@ -1,0 +1,14 @@
+Baby5 V10 — Persistent API Retry + Sticky Successful Key/Model
+
+Changes in this build:
+- Default model remains gemini-3.1-flash-lite.
+- The most recently successful model is tried first on the next subtitle batch. The current API key slot is also retained after success, so the same working key/model pair is reused while it keeps succeeding.
+- If that pair fails, the bot tries the other configured models and API keys. Once a key/model pair succeeds, subsequent batches return to using that successful pair first.
+- If every configured key/model option returns a transient API/quota/availability error, the bot waits before trying the combinations again: 60 seconds after quota/rate-limit exhaustion, 30 seconds after service-unavailable errors, or 20 seconds for other transient errors. This avoids rapid request loops while continuing the same batch.
+- A successful response still uses the existing subtitle validation. Non-retryable errors are reported instead of being retried forever.
+- Translation prompt/rules, subtitle timing, batch size defaults, queue limits, per-file SRT delivery, final ZIP behavior, and progress UI are otherwise preserved.
+
+Notes:
+- Persistent retry needs the Colab runtime/bot process to remain running. It cannot overcome permanently exhausted account/project quotas or a model that is unavailable to every configured account.
+- API requests are not sent during the cooldown. Normal successful translation flow has no added delay.
+- Syntax was checked locally; a live Telegram/Gemini job was not run as part of packaging.

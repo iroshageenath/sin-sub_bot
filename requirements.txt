@@ -1,0 +1,5 @@
+python-telegram-bot==22.8
+google-genai>=1.65,<2
+pydantic>=2.7,<3
+pysubs2>=1.8,<2
+python-dotenv>=1.0,<2
