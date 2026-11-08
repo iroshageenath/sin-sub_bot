@@ -1,0 +1,31 @@
+BABY 5 UPDATE — COLAB TEST BUILD
+
+Source baseline:
+- anime_sinhala_bot_oracle_persistent_db (1).zip (current GitHub-committed source supplied by the user)
+
+Included changes:
+- New-user defaults: Super Fast mode and batch size 100; existing saved preferences are not overwritten.
+- /panel Statistics: Today, Last 7 Days, Last 30 Days reports with new-user names, translated-file counts, failed-file/line counts, average file duration, and active-job status.
+- /status: active job owner ID, job mode/batch, live Gemini model, total lines, and completed/translated/failed counts.
+- Developer group: captioned upload file logs, output SRT attachments replying to the upload log, and a live progress mirror deleted at job end.
+- Progress card formatting refreshed to the requested Baby 5 layout.
+- Lightweight random Telegram message reactions; reaction errors do not interrupt translation.
+- VIP promotion DM and developer-group audit entry, with a clear warning if the user has not started the bot.
+- Sinhala prompt strengthened for natural spoken Sri Lankan Sinhala and context-appropriate slang/profanity.
+- Colab notebook updated to accept the uploaded ZIP filename and explicitly use a separate TEST bot token.
+
+Important:
+- No .env, live VPS database, GitHub settings, or production bot token is included or modified.
+- Existing saved per-user settings are preserved. New users receive Super Fast / Batch 100.
+- Statistics event history starts accumulating after this updated build is run; older completed jobs cannot be reconstructed from the existing aggregate user counter.
+- Telegram button labels use emoji/color cues; Telegram clients determine actual rendering.
+- This ZIP is for Colab testing only. Do not deploy it to the live VPS until the user confirms testing passes.
+
+
+FOLLOW-UP FIX — OWNER PRIVACY, PROGRESS BAR, SPOKEN SINHALA
+- Bot owner (ADMIN_USER_ID) activity is excluded centrally from all developer-group log sends.
+- Owner uploads, active progress, output files, translation failures, and VIP/admin action logs are not mirrored to the developer group.
+- Non-owner user/admin developer logs remain enabled.
+- Progress bar now uses a Telegram Markdown fenced code block, so the three backticks are formatting syntax and are not visible in the rendered message.
+- Strengthened the Sinhala prompt to select “උඹ” for rough/close/hostile dialogue when context warrants it, retain “ඔයා” for friendly/respectful speech, and prefer natural phrases such as “පොළොව හෙල්ලෙනවා” over literal/bookish wording.
+- Reviewed the 12 SRT files in the supplied Chainsaw Man Season 1 reference ZIP for pronoun/register patterns.

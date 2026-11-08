@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import os
+import random
 import shutil
 import sqlite3
 import time
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from telegram.constants import ParseMode
+from telegram.helpers import escape_markdown
+
 from telegram import (
     BotCommand, BotCommandScopeChat, BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
-    InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update,
+    InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update, ReactionTypeEmoji,
 )
 
 # Telegram Bot API supports actual inline-button styles: primary (blue),
@@ -102,9 +107,14 @@ class BotState:
     error_messages: list[str] = field(default_factory=list)
     translated_successes: int = 0
     failed_subtitles: int = 0
-    batch_size: int = 50
+    batch_size: int = 100
     queue_timeout_task: asyncio.Task | None = None
     _last_progress_text: str = ""
+    total_lines: int = 0
+    active_file_name: str = ""
+    job_started_at: float = 0.0
+    dev_upload_message_id: int | None = None
+    dev_progress_message_id: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -175,14 +185,25 @@ class SubtitleBot:
                 CREATE TABLE IF NOT EXISTS unlimited(user_id INTEGER PRIMARY KEY, added_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS usage(user_id INTEGER NOT NULL, day TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id, day));
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS user_settings(user_id INTEGER PRIMARY KEY, batch_size INTEGER NOT NULL DEFAULT 50, daily_limit INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL DEFAULT 'normal');
+                CREATE TABLE IF NOT EXISTS user_settings(user_id INTEGER PRIMARY KEY, batch_size INTEGER NOT NULL DEFAULT 100, daily_limit INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL DEFAULT 'superfast');
+                CREATE TABLE IF NOT EXISTS translation_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    file_name TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    translated_lines INTEGER NOT NULL DEFAULT 0,
+                    failed_lines INTEGER NOT NULL DEFAULT 0,
+                    duration_seconds REAL NOT NULL DEFAULT 0
+                );
             """)
             columns = {r[1] for r in db.execute("PRAGMA table_info(users)")}
             if "start_logged" not in columns:
                 db.execute("ALTER TABLE users ADD COLUMN start_logged INTEGER NOT NULL DEFAULT 0")
             user_settings_columns = {r[1] for r in db.execute("PRAGMA table_info(user_settings)")}
             if "mode" not in user_settings_columns:
-                db.execute("ALTER TABLE user_settings ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal'")
+                db.execute("ALTER TABLE user_settings ADD COLUMN mode TEXT NOT NULL DEFAULT 'superfast'")
 
     def _db_has(self, table: str, user_id: int) -> bool:
         if table not in {"admins", "banned", "vip", "unlimited"}:
@@ -201,7 +222,7 @@ class SubtitleBot:
                 return False
             db.execute("INSERT INTO users(user_id,username,full_name,first_seen,last_seen) VALUES(?,?,?,?,?)",
                        (user.id, user.username or "", user.full_name or "", now, now))
-            db.execute("INSERT OR IGNORE INTO user_settings(user_id,batch_size,daily_limit) VALUES(?,?,0)", (user.id, 50))
+            db.execute("INSERT OR IGNORE INTO user_settings(user_id,batch_size,daily_limit,mode) VALUES(?,?,0,?)", (user.id, 100, "superfast"))
             return True
 
     def _mark_start_once(self, user_id: int) -> bool:
@@ -220,7 +241,7 @@ class SubtitleBot:
     def _get_batch(self, user_id: int) -> int:
         with self._db() as db:
             row = db.execute("SELECT batch_size FROM user_settings WHERE user_id=?", (user_id,)).fetchone()
-            return int(row[0]) if row else 50
+            return int(row[0]) if row else 100
 
     def _set_batch(self, user_id: int, size: int) -> None:
         with self._db() as db:
@@ -230,14 +251,14 @@ class SubtitleBot:
     def _get_mode(self, user_id: int) -> str:
         with self._db() as db:
             row = db.execute("SELECT mode FROM user_settings WHERE user_id=?", (user_id,)).fetchone()
-            return str(row[0]) if row and row[0] in {"normal", "fast", "superfast"} else "normal"
+            return str(row[0]) if row and row[0] in {"normal", "fast", "superfast"} else "superfast"
 
     def _set_mode(self, user_id: int, mode: str) -> None:
         if mode not in {"normal", "fast", "superfast"}:
             return
         with self._db() as db:
             db.execute("INSERT INTO user_settings(user_id,batch_size,daily_limit,mode) VALUES(?,?,0,?) "
-                       "ON CONFLICT(user_id) DO UPDATE SET mode=excluded.mode", (user_id, 50, mode))
+                       "ON CONFLICT(user_id) DO UPDATE SET mode=excluded.mode", (user_id, 100, mode))
 
     def _is_premium_mode_user(self, user_id: int) -> bool:
         return user_id == self.s.admin_user_id or self._db_has("vip", user_id)
@@ -250,33 +271,79 @@ class SubtitleBot:
             row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         return row is None or row[0] == "1"
 
-    async def _dev_log(self, text: str, *, file_path: Path | None = None, source_chat_id: int | None = None, source_message_id: int | None = None) -> None:
-        """Developer logs intentionally exclude every action performed by the configured owner."""
+    async def _dev_log(self, text: str, *, actor_user_id: int, file_path: Path | None = None, source_chat_id: int | None = None, source_message_id: int | None = None, reply_to_message_id: int | None = None):
+        """Send developer logs only for non-owner activity.
+
+        The configured bot owner is completely private: no owner action,
+        upload, output, failure, or related file is mirrored to the dev group.
+        """
+        if int(actor_user_id) == int(self.s.admin_user_id):
+            return None
         if not self.s.dev_group_id or not self.application:
-            return
+            return None
         try:
-            if text:
-                await self.application.bot.send_message(chat_id=self.s.dev_group_id, text=text[:3900])
             if file_path and file_path.exists() and file_path.stat().st_size <= 50 * 1024 * 1024:
                 with file_path.open("rb") as fh:
-                    await self.application.bot.send_document(chat_id=self.s.dev_group_id, document=InputFile(fh, filename=file_path.name), caption=(text[:900] if text else file_path.name))
-            elif source_chat_id and source_message_id:
-                await self.application.bot.copy_message(chat_id=self.s.dev_group_id, from_chat_id=source_chat_id, message_id=source_message_id)
+                    return await self.application.bot.send_document(
+                        chat_id=self.s.dev_group_id,
+                        document=InputFile(fh, filename=file_path.name),
+                        caption=(text or file_path.name)[:1024],
+                        reply_to_message_id=reply_to_message_id,
+                    )
+            if text:
+                return await self.application.bot.send_message(
+                    chat_id=self.s.dev_group_id, text=text[:3900],
+                    reply_to_message_id=reply_to_message_id,
+                )
+            if source_chat_id and source_message_id:
+                return await self.application.bot.copy_message(
+                    chat_id=self.s.dev_group_id, from_chat_id=source_chat_id,
+                    message_id=source_message_id, reply_to_message_id=reply_to_message_id,
+                )
         except Exception as exc:
             print(f"[DEV_GROUP_ID log error] {exc.__class__.__name__}: {str(exc)[:160]}")
+        return None
 
-    async def _notify_user(self, user_id: int, text: str) -> None:
-        """Send an English-only account/permission notice; ignore users who blocked the bot."""
+    async def _safe_react(self, chat_id: int, message_id: int, pool: tuple[str, ...]) -> None:
+        try:
+            await self.application.bot.set_message_reaction(
+                chat_id=chat_id, message_id=message_id,
+                reaction=[ReactionTypeEmoji(emoji=random.choice(pool))],
+            )
+        except Exception as exc:
+            print(f"[reaction skipped] {exc.__class__.__name__}")
+
+    def _schedule_reaction(self, chat_id: int | None, message_id: int | None, pool: tuple[str, ...]) -> None:
+        if not chat_id or not message_id or not self.application:
+            return
+        asyncio.create_task(self._safe_react(chat_id, message_id, pool))
+
+    def _record_translation_event(self, user_id: int, file_name: str, status: str,
+                                  started: float, translated: int, failed: int) -> None:
+        ended = time.time()
+        start_text = datetime.fromtimestamp(started, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        end_text = datetime.fromtimestamp(ended, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        with self._db() as db:
+            db.execute(
+                "INSERT INTO translation_events(user_id,file_name,status,started_at,completed_at,translated_lines,failed_lines,duration_seconds) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (user_id, file_name[:255], status, start_text, end_text, translated, failed, max(0, ended-started)),
+            )
+
+    async def _notify_user(self, user_id: int, text: str) -> bool:
+        """Return whether a direct message was delivered."""
         try:
             await self.application.bot.send_message(chat_id=int(user_id), text=text)
+            return True
         except Exception as exc:
             print(f"[user notification] ID {user_id}: {exc.__class__.__name__}")
+            return False
 
     async def _log_admin_action(self, update: Update, action: str) -> None:
         u = update.effective_user
         if not u or u.id == self.s.admin_user_id:
             return
-        await self._dev_log(f"🛡️ ADMIN ACTION\nAdmin: {u.full_name}\nUsername: @{u.username or 'N/A'}\nUser ID: {u.id}\nAction: {action}\nTime (UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}")
+        await self._dev_log(f"🛡️ ADMIN ACTION\nAdmin: {u.full_name}\nUsername: @{u.username or 'N/A'}\nUser ID: {u.id}\nAction: {action}\nTime (UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}", actor_user_id=u.id)
 
     def _is_banned(self, user_id: int) -> bool:
         return self._db_has("banned", user_id)
@@ -446,7 +513,18 @@ class SubtitleBot:
             return
         first_start = self._mark_start_once(user.id)
         if first_start and user.id != self.s.admin_user_id:
-            await self._dev_log(f"🆕 NEW USER STARTED\nName: {user.full_name}\nUsername: @{user.username or 'N/A'}\nUser ID: {user.id}\nFirst seen (UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}")
+            await self._dev_log(
+                "✨ 𝐁𝐀𝐁𝐘 𝟓 · 𝐃𝐄𝐕 𝐂𝐎𝐍𝐍𝐄𝐂𝐓\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "🎉 NEW USER · WELCOME TO BABY 5\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Name: {user.full_name}\n"
+                f"🔖 Username: @{user.username or 'N/A'}\n"
+                f"🆔 User ID: {user.id}\n"
+                f"🕒 First started: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n"
+                "💛 A new member has joined the Baby 5 community.",
+                actor_user_id=user.id,
+            )
         with self._db() as db:
             maintenance = db.execute("SELECT value FROM settings WHERE key='maintenance'").fetchone()
         if maintenance and maintenance[0] == '1' and not self.is_admin(update):
@@ -497,19 +575,27 @@ class SubtitleBot:
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         st = self.state
+        if not st.processing:
+            await self._message(update).reply_text("📊 BABY 5 STATUS\n\n🟢 No active translation job right now.")
+            return
+        total = max(int(st.total_lines or 0), 1)
+        done = min(st.translated_successes + st.failed_subtitles, total)
+        mode_labels = {"normal": "Normal", "fast": "Fast", "superfast": "Super Fast"}
+        active_user = st.owner_id or 0
         await self._message(update).reply_text(
-            "📊 Status\n"
-            "Mode: Translate to Sinhala (ASS/SSA auto-convert)\n"
-            f"Batch size: {self._get_batch(update.effective_user.id) if update.effective_user else st.batch_size} lines\n"
-            f"Mode: {self._get_mode(update.effective_user.id) if update.effective_user else 'normal'}\n"
-            f"Queue: {len(st.pending)}/{self.s.max_files}\n"
-            f"Processing: {'yes' if st.processing else 'no'}\n"
-            f"Selected model: {st.selected_model}\n"
-            f"Last API model: {self.gemini.last_used_model}\n"
-            f"Gemini keys configured: {sum(bool(k) for k in self.s.gemini_keys)}/10\n"
-            f"Translated in current job: {st.translated_successes}\n"
-            f"Failed/original kept: {st.failed_subtitles}\n"
-            f"Owner: {st.owner_id or 'none'}"
+            "✨ <b>𝐁𝐀𝐁𝐘 𝟓 · LIVE JOB STATUS</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"👤 User ID: <code>{active_user}</code>\n"
+            f"📁 File: <code>{html.escape(st.active_file_name or 'Preparing files…')}</code>\n"
+            f"⚙️ Mode: <b>{mode_labels.get(getattr(self, '_active_mode', 'superfast'), 'Super Fast')}</b>\n"
+            f"📦 Batch: <b>{st.batch_size}</b>\n"
+            f"🤖 Gemini model: <code>{html.escape(self.gemini.last_used_model or st.selected_model)}</code>\n"
+            f"📝 Total lines: <b>{st.total_lines:,}</b>\n"
+            f"🌊 Completed: <b>{done:,}/{st.total_lines:,}</b>\n"
+            f"🇱🇰 Translated: <b>{st.translated_successes:,}</b>\n"
+            f"⚠️ Failed/original kept: <b>{st.failed_subtitles:,}</b>\n"
+            "🟢 Active job: <b>Yes · Translating</b>",
+            parse_mode="HTML",
         )
 
     async def settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -804,7 +890,7 @@ class SubtitleBot:
         if data.startswith("adm:") and not self.is_owner(update):
             await q.answer("Owner only", show_alert=True)
             return
-        if data.startswith(("panel:", "users:", "ban:", "vip:", "limit:", "broadcast:", "maint:")) and not self.is_admin(update):
+        if data.startswith(("panel:", "users:", "ban:", "vip:", "limit:", "broadcast:", "maint:", "stats:")) and not self.is_admin(update):
             await q.answer("Access denied", show_alert=True)
             return
         if data in {"panel:toggle_fast", "panel:toggle_superfast"} and not self.is_owner(update):
@@ -907,13 +993,63 @@ class SubtitleBot:
             await self._log_admin_action(update, f"Removed user registry entry ID {target}")
             await q.edit_message_text(f"User {target} removed from the registry. This does not block them; use Ban User to block access.",reply_markup=InlineKeyboardMarkup([self._back_button("panel:users")]))
         elif data == "panel:stats":
+            await q.edit_message_text(
+                "📊 *BABY 5 · STATISTICS*\nChoose a reporting period:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🟢 Today", callback_data="stats:today")],
+                    [InlineKeyboardButton("🔵 Last 7 Days", callback_data="stats:7d")],
+                    [InlineKeyboardButton("🟣 Last 30 Days", callback_data="stats:30d")],
+                    self._back_button(),
+                ]),
+            )
+        elif data.startswith("stats:"):
+            period = data.split(":", 1)[1]
+            days = {"today": 1, "7d": 7, "30d": 30}.get(period)
+            if not days:
+                return
+            now = datetime.now(timezone.utc)
+            start_dt = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) if period == "today" else now - timedelta(days=days)
+            start_iso = start_dt.strftime("%Y-%m-%d %H:%M:%S")
             with self._db() as db:
-                total=db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-                today=db.execute("SELECT COUNT(*) FROM users WHERE first_seen LIKE ?",(date.today().isoformat()+"%",)).fetchone()[0]
-                files=db.execute("SELECT COALESCE(SUM(translations),0) FROM users").fetchone()[0]
-                banned=db.execute("SELECT COUNT(*) FROM banned").fetchone()[0]
-                vip=db.execute("SELECT COUNT(*) FROM vip").fetchone()[0]
-            await q.edit_message_text(f"📊 BOT STATISTICS\\nUsers: {total}\\nNew users today: {today}\\nCompleted files: {files}\\nBanned users: {banned}\\nVIP users: {vip}\\nActive job: {'yes' if self.state.processing else 'no'}",reply_markup=InlineKeyboardMarkup([self._back_button()]))
+                new_users = db.execute(
+                    "SELECT user_id,username,full_name,first_seen FROM users WHERE first_seen>=? AND start_logged=1 ORDER BY first_seen DESC",
+                    (start_iso,),
+                ).fetchall()
+                ev = db.execute(
+                     "SELECT COALESCE(SUM(CASE WHEN status IN ('completed','completed_with_errors') THEN 1 ELSE 0 END),0) AS files, "
+                    "COALESCE(SUM(CASE WHEN status IN ('failed','completed_with_errors') THEN 1 ELSE 0 END),0) AS failed_files, "
+                    "COALESCE(SUM(failed_lines),0) AS failed_lines, "
+                    "COALESCE(AVG(CASE WHEN status IN ('completed','completed_with_errors') THEN duration_seconds END),0) AS avg_time "
+                    "FROM translation_events WHERE started_at>=?",
+                    (start_iso,),
+                ).fetchone()
+            label = {"today": "Today", "7d": "Last 7 Days", "30d": "Last 30 Days"}[period]
+            names = []
+            for r in new_users[:20]:
+                nm = r["full_name"] or "Unknown"
+                un = f" (@{r['username']})" if r["username"] else ""
+                names.append(f"• {html.escape(nm)}{html.escape(un)} · <code>{r['user_id']}</code>")
+            if len(new_users) > 20:
+                names.append(f"• +{len(new_users)-20} more user(s)")
+            if not names:
+                names = ["• None"]
+            active = "Yes · Translating" if self.state.processing else "No"
+            await q.edit_message_text(
+                f"📊 <b>BABY 5 · {label.upper()} REPORT</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👥 New users: <b>{len(new_users)}</b>\n" + "\n".join(names) + "\n"
+                f"📁 Translated files: <b>{ev['files']}</b>\n"
+                f"❌ Failed translation files: <b>{ev['failed_files']}</b>\n"
+                f"⚠️ Failed subtitle lines: <b>{ev['failed_lines']}</b>\n"
+                f"⏱ Average time/file: <b>{float(ev['avg_time'] or 0):.1f}s</b>\n"
+                f"🔄 Active job: <b>{html.escape(active)}</b>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Periods", callback_data="panel:stats")],
+                    self._back_button(),
+                ]),
+            )
         elif data == "panel:maintenance":
             with self._db() as db: row=db.execute("SELECT value FROM settings WHERE key='maintenance'").fetchone()
             enabled=bool(row and row[0]=='1')
@@ -1003,8 +1139,30 @@ class SubtitleBot:
         if prompt in {"unlimited_user","vip_add"}:
             table="unlimited" if prompt=="unlimited_user" else "vip"
             with self._db() as db: db.execute(f"INSERT OR IGNORE INTO {table}(user_id,added_at) VALUES(?,?)",(target,time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime())))
-            await self._log_admin_action(update, f"Granted {'unlimited usage' if table=='unlimited' else 'VIP access'} to user ID {target}")
-            context.user_data.pop("admin_prompt",None); await msg.reply_text(f"{'Unlimited access' if table=='unlimited' else 'VIP access'} enabled for user {target}.", reply_markup=InlineKeyboardMarkup([self._back_button("panel:users")])); return
+            if table == "unlimited":
+                await self._log_admin_action(update, f"Granted unlimited usage to user ID {target}")
+            if table == "vip":
+                delivered = await self._notify_user(
+                    target,
+                    "✨ 𝐁𝐀𝐁𝐘 𝟓 · 𝐏𝐑𝐄𝐌𝐈𝐔𝐌\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "🎉 Congratulations! Your account has been upgraded to VIP.\n\n"
+                    "🚀 You can now enjoy VIP translation modes and premium access.\n"
+                    "💛 Thank you for supporting Baby 5!",
+                )
+                await self._dev_log(
+                    "✨ 𝐁𝐀𝐁𝐘 𝟓 · 𝐃𝐄𝐕 𝐂𝐎𝐍𝐍𝐄𝐂𝐓\n"
+                    "⭐ VIP PROMOTION\n"
+                    f"👤 Target User ID: {target}\n"
+                    f"🛡️ Admin: {update.effective_user.full_name} · ID {update.effective_user.id}\n"
+                    f"📩 VIP notification: {'Delivered' if delivered else 'Not delivered — user must start the bot'}",
+                    actor_user_id=update.effective_user.id,
+                )
+            context.user_data.pop("admin_prompt",None)
+            note = f"{'Unlimited access' if table=='unlimited' else 'VIP access'} enabled for user {target}."
+            if table == "vip" and not delivered:
+                note += "\n⚠️ VIP notification could not be delivered. Ask the user to open the bot and press /start."
+            await msg.reply_text(note, reply_markup=InlineKeyboardMarkup([self._back_button("panel:users")])); return
 
     async def _broadcast_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user=update.effective_user; msg=update.effective_message
@@ -1089,8 +1247,6 @@ class SubtitleBot:
             await message.reply_text(f"Daily limit reached ({limit} subtitle file(s) per day). Try again tomorrow or contact the bot owner.")
             return
         self._set_user_action(user.id, f"Uploaded {filename}")
-        if user.id != self.s.admin_user_id:
-            await self._dev_log(f"📥 USER UPLOAD\nName: {user.full_name}\nUsername: @{user.username or 'N/A'}\nUser ID: {user.id}\nFile: {filename}\nTime (UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}", source_chat_id=message.chat_id, source_message_id=message.message_id)
         job_dir = self._ensure_work_dir()
         incoming = unique_path(job_dir / "incoming", filename)
 
@@ -1101,6 +1257,24 @@ class SubtitleBot:
             tg_file = await message.document.get_file()
             await tg_file.download_to_drive(custom_path=str(incoming))
             validate_file_size(incoming, self.s.max_download_mb * 1024 * 1024)
+            mode_label = {"normal": "Normal", "fast": "Fast", "superfast": "Super Fast"}.get(self._get_mode(user.id), "Super Fast")
+            dev_caption = (
+                "✨ 𝐁𝐀𝐁𝐘 𝟓 · 𝐃𝐄𝐕 𝐂𝐎𝐍𝐍𝐄𝐂𝐓\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "📥 NEW TRANSLATION REQUEST · USER UPLOAD\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👤 {user.full_name} (@{user.username or 'N/A'})\n"
+                f"🆔 ID: {user.id}\n"
+                f"📁 File: {filename}\n"
+                f"⚙️ Mode: {mode_label}\n"
+                f"📦 Batch: {self._get_batch(user.id)}\n"
+                f"🕒 {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+            )
+            dev_msg = await self._dev_log(dev_caption, file_path=incoming, actor_user_id=user.id)
+            self.state.dev_upload_message_id = dev_msg.message_id if dev_msg else None
+            self._schedule_reaction(message.chat_id, message.message_id, ("❤️", "🔥", "👌", "🎬"))
+            if dev_msg:
+                self._schedule_reaction(self.s.dev_group_id, dev_msg.message_id, ("❤️", "🔥", "👌", "🎬"))
         except Exception as exc:
             incoming.unlink(missing_ok=True)
             await message.reply_text(f"❌ Download failed: {self._short_error(exc)}")
@@ -1161,7 +1335,7 @@ class SubtitleBot:
             await query.answer()
             return
 
-        if data.startswith(("adm:", "panel:", "users:", "ban:", "vip:", "limit:", "broadcast:", "maint:")):
+        if data.startswith(("adm:", "panel:", "users:", "ban:", "vip:", "limit:", "broadcast:", "maint:", "stats:")):
             await self._admin_callback(update, context, data)
             return
 
@@ -1369,6 +1543,12 @@ class SubtitleBot:
                 )
         self.state.queue_message_id = None
         self.state.queue_chat_id = None
+        if self.application and self.s.dev_group_id and self.state.dev_progress_message_id:
+            with contextlib.suppress(Exception):
+                await self.application.bot.delete_message(
+                    chat_id=self.s.dev_group_id, message_id=self.state.dev_progress_message_id
+                )
+        self.state.dev_progress_message_id = None
 
     async def _busy_message(self, update: Update) -> None:
         await self._message(update).reply_text(
@@ -1381,15 +1561,16 @@ class SubtitleBot:
 
     async def _process_job(self, chat_id: int) -> None:
         self.state.processing = True
+        self.state.job_started_at = time.time()
         self.gemini.reset_rotation()
         if self.state.owner_id:
             self.state.batch_size = self._get_batch(self.state.owner_id)
             self._active_mode = self._get_mode(self.state.owner_id)
             if not self._is_premium_mode_user(self.state.owner_id) and not self._mode_enabled(self._active_mode):
-                self._active_mode = "normal"
+                self._active_mode = "superfast"
         else:
             self.state.batch_size = 50
-            self._active_mode = "normal"
+            self._active_mode = "superfast"
         self.state.cancel_requested = False
         self.state.cancel_event.clear()
         self.state.error_messages.clear()
@@ -1407,12 +1588,14 @@ class SubtitleBot:
             if not self.state.progress_message_id:
                 msg = await self.application.bot.send_message(chat_id=chat_id, text="🧠 Reading subtitle files…")
                 self.state.progress_message_id = msg.message_id
+                self._schedule_reaction(chat_id, msg.message_id, ("⚡", "🔥", "👀", "🚀"))
 
             # Pre-read all files so we know total subtitle count before starting
             total_subtitles = 0
             for pf in list(self.state.pending):
                 if self.state.cancel_requested:
                     raise asyncio.CancelledError
+                preprocess_started = time.time()
                 try:
                     work_srt = await self._prepare_srt(pf, job_dir)
                     items = read_srt(work_srt)
@@ -1424,7 +1607,14 @@ class SubtitleBot:
                     self.state.error_messages.append(
                         f"{pf.original_name}: preprocess failed ({self._short_error(exc)}) — skipped"
                     )
+                    if self.state.owner_id:
+                        with contextlib.suppress(Exception):
+                            self._record_translation_event(
+                                self.state.owner_id, pf.original_name, "failed",
+                                preprocess_started, 0, 0,
+                            )
 
+            self.state.total_lines = total_subtitles
             if not file_items:
                 await self._update_progress(
                     chat_id, "❌ No valid subtitle files", 0, 1, len(self.state.error_messages),
@@ -1443,6 +1633,10 @@ class SubtitleBot:
             glossary: dict[str, str] = {}  # shared glossary across all files in job
 
             for file_index, (pf, items, title_hint, out) in enumerate(file_items, start=1):
+                self.state.active_file_name = pf.original_name
+                file_started_at = time.time()
+                failed_before_file = self.state.failed_subtitles
+                translated_before_file = self.state.translated_successes
                 # Shared success epoch lets a successful parallel batch reset the
                 # consecutive-failure round counter of sibling batches.
                 rotation_state = {"success_epoch": 0}
@@ -1455,7 +1649,7 @@ class SubtitleBot:
                 ]
                 chunks = build_chunks(items, self.state.batch_size, self.s.max_chars_per_call)
 
-                mode = getattr(self, "_active_mode", "normal")
+                mode = getattr(self, "_active_mode", "superfast")
                 if mode == "normal":
                     work_groups = [[(idx, chunk, None)] for idx, chunk in enumerate(chunks, start=1)]
                 else:
@@ -1576,15 +1770,18 @@ class SubtitleBot:
                 self._add_credit_cues(out, translated)
                 outputs.append(out)
                 await self._send_single_output(chat_id, out, len(outputs), total_files)
+                owner_id = self.state.owner_id
+                if owner_id:
+                    file_failed = self.state.failed_subtitles - failed_before_file
+                    file_translated = self.state.translated_successes - translated_before_file
+                    status = "completed_with_errors" if file_failed else "completed"
+                    self._record_translation_event(owner_id, pf.original_name, status, file_started_at,
+                                                    file_translated, file_failed)
                 # Admin-system bookkeeping only; translation flow above remains the original implementation.
                 owner_id = self.state.owner_id
                 if owner_id:
                     self._increment_usage(owner_id, 1)
-                    if owner_id != self.s.admin_user_id:
-                        with self._db() as db:
-                            row = db.execute("SELECT username, full_name FROM users WHERE user_id=?", (owner_id,)).fetchone()
-                        who = f"{row['full_name'] if row else 'Unknown'} (@{row['username'] if row and row['username'] else 'N/A'}, ID {owner_id})"
-                        await self._dev_log(f"📤 TRANSLATION OUTPUT\nUser: {who}\nOutput: {out.name}\nModel: {self.state.selected_model}\nStatus: completed\nTime (UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}", file_path=out)
+
 
             # ── Job complete ──
             self.state.last_results = LastResults(outputs, job_dir, chat_id, time.time())
@@ -1629,10 +1826,16 @@ class SubtitleBot:
         except Exception as exc:
             self.state.error_messages.append(f"JOB: {self._short_error(exc)}")
             job_user_id = self.state.owner_id
+            if job_user_id and self.state.active_file_name:
+                with contextlib.suppress(Exception):
+                    self._record_translation_event(
+                        job_user_id, self.state.active_file_name, "failed",
+                        self.state.job_started_at or time.time(), 0, 0,
+                    )
             if job_user_id and job_user_id != self.s.admin_user_id:
                 with self._db() as db:
                     job_user = db.execute("SELECT username,full_name FROM users WHERE user_id=?", (job_user_id,)).fetchone()
-                await self._dev_log(f"⚠️ TRANSLATION FAILED\nUser: {job_user['full_name'] if job_user else 'Unknown'}\nUsername: @{job_user['username'] if job_user and job_user['username'] else 'N/A'}\nUser ID: {job_user_id}\nModel: {self.state.selected_model}\nError: {self._short_error(exc)}\nTime (UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}")
+                await self._dev_log(f"⚠️ TRANSLATION FAILED\nUser: {job_user['full_name'] if job_user else 'Unknown'}\nUsername: @{job_user['username'] if job_user and job_user['username'] else 'N/A'}\nUser ID: {job_user_id}\nModel: {self.state.selected_model}\nError: {self._short_error(exc)}\nTime (UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}", actor_user_id=job_user_id)
             if isinstance(exc, GeminiQuotaExhaustedError):
                 note = (
                     "⛔ Gemini API quota/rate limit reached on all configured keys.\n"
@@ -1867,11 +2070,31 @@ class SubtitleBot:
                 self.state.error_messages.append(f"{path.name}: output exceeds Telegram 50 MB limit")
                 return
             with path.open("rb") as fh:
-                await self.application.bot.send_document(
+                sent = await self.application.bot.send_document(
                     chat_id=chat_id,
                     document=InputFile(fh, filename=path.name),
                     caption=f"✅ Output {index}/{total} · {path.name}",
                 )
+            owner_id = self.state.owner_id
+            if owner_id and self.s.dev_group_id:
+                with self._db() as db:
+                    row = db.execute("SELECT username,full_name FROM users WHERE user_id=?", (owner_id,)).fetchone()
+                who = f"{row['full_name'] if row else 'Unknown'} (@{row['username'] if row and row['username'] else 'N/A'}) · ID {owner_id}"
+                dev_caption = (
+                    "✨ 𝐁𝐀𝐁𝐘 𝟓 · 𝐃𝐄𝐕 𝐂𝐎𝐍𝐍𝐄𝐂𝐓\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "✅ TRANSLATION COMPLETED · OUTPUT ATTACHED\n"
+                    f"👤 {who}\n"
+                    f"📁 {path.name} · {index}/{total}\n"
+                    f"🤖 {self.gemini.last_used_model or self.state.selected_model}\n"
+                    f"📝 Translated: {self.state.translated_successes:,} · Failed: {self.state.failed_subtitles:,}"
+                )
+                dev_sent = await self._dev_log(dev_caption, file_path=path,
+                                               reply_to_message_id=self.state.dev_upload_message_id,
+                                               actor_user_id=owner_id)
+                if dev_sent:
+                    self._schedule_reaction(self.s.dev_group_id, dev_sent.message_id, ("🎉", "❤️", "🔥"))
+            self._schedule_reaction(chat_id, sent.message_id, ("🎉", "❤️", "🔥"))
             await asyncio.sleep(self.s.send_delay)
         except Exception as exc:
             self.state.error_messages.append(f"{path.name}: send failed ({self._short_error(exc)})")
@@ -1922,49 +2145,60 @@ class SubtitleBot:
         pct = min(100, int(done * 100 / denom))
         filled = min(10, pct // 10)
         bar = "▰" * filled + "▱" * (10 - filled)
-
-        lines = [
-            "✨ 𝐁𝐀𝐁𝐘 𝟓  ·  SINHALA LIVE",
-            "━━━━━━━━━━━━━━━━━━",
-            label,
-            f"{bar}  {pct}%",
-            f"📍 Processed  {min(done, denom):,}/{denom:,} lines",
-        ]
-        if total:
-            lines.append(f"🇱🇰 Translated  {translated_total:,}/{total:,}")
-        else:
-            lines.append("📝 ASS/SSA conversion only — no translation requested")
         mode_labels = {"normal": "Normal", "fast": "Fast", "superfast": "Super Fast"}
-        lines.append(
-            f"⚙️ {mode_labels.get(getattr(self, '_active_mode', 'normal'), 'Normal')} mode"
-            f" · Batch {self.state.batch_size} · {self.state.selected_model}"
-        )
-        lines.append(f"📦 Queue  {len(self.state.pending)}/{self.s.max_files} files")
+        # Premium header is a Telegram blockquote by itself; keep the divider
+        # outside it. Only the progress bar uses a monospace code block.
+        lines = [
+            "<blockquote>✨ 𝐁𝐀𝐁𝐘 𝟓 · SINHALA LIVE</blockquote>",
+            "━━━━━━━━━━━━━━━━━━",
+            "❄️ " + html.escape(label.replace("🧠 ", "").replace("🎬 ", "").replace("\\n", " ")[:120]),
+            f"<pre>{bar}  {pct}%</pre>",
+            f"🌊 Processed {min(done, denom):,}/{denom:,} lines",
+            f"📝 Translated {translated_total:,}/{denom:,}",
+            f"⚙️ {html.escape(mode_labels.get(getattr(self, '_active_mode', 'superfast'), 'Super Fast'))} mode · Batch {self.state.batch_size}",
+            f"👾 {html.escape(str(self.gemini.last_used_model or self.state.selected_model))}",
+            f"⏳ Queue {len(self.state.pending)}/{self.s.max_files} files",
+        ]
         if failed_total:
-            lines.append(f"⚠️ Original kept  {failed_total:,} line(s)")
+            lines.append(f"⚠️ Failed/original kept {failed_total:,} lines")
         if errors:
             recent = self.state.error_messages[-1:]
             lines.append("⚠️ Latest issue")
-            lines.extend(f"• {x}" for x in recent)
+            lines.extend(f"• {html.escape(str(x))}" for x in recent)
             if errors > 1:
                 lines.append(f"• +{errors - 1} more issue(s)")
-
+        # Dynamic text is HTML-escaped above; use Telegram HTML for the
+        # quote-card headline and keep the divider as ordinary text.
         text = "\n".join(lines)
-        # Skip edit if nothing changed — avoids Telegram "message not modified" errors
-        # and unnecessary API calls that slow the job down.
         if text == self.state._last_progress_text:
             return
         self.state._last_progress_text = text
         if self.state.progress_message_id and self.application:
             with contextlib.suppress(Exception):
                 await self.application.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=self.state.progress_message_id,
-                    text=text,
+                    chat_id=chat_id, message_id=self.state.progress_message_id,
+                    text=text, parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("🔴 Stop", callback_data="stop_job")
                     ]]),
                 )
+        if (self.s.dev_group_id and self.application
+                and self.state.owner_id != self.s.admin_user_id):
+            try:
+                if self.state.dev_progress_message_id is None:
+                    dev_msg = await self.application.bot.send_message(
+                        chat_id=self.s.dev_group_id, text=text, parse_mode=ParseMode.HTML
+                    )
+                    self.state.dev_progress_message_id = dev_msg.message_id
+                    self._schedule_reaction(self.s.dev_group_id, dev_msg.message_id, ("⚡", "🔥", "👀", "🚀"))
+                else:
+                    await self.application.bot.edit_message_text(
+                        chat_id=self.s.dev_group_id,
+                        message_id=self.state.dev_progress_message_id,
+                        text=text, parse_mode=ParseMode.HTML,
+                    )
+            except Exception as exc:
+                print(f"[DEV progress mirror] {exc.__class__.__name__}")
 
 
 # ---------------------------------------------------------------------------
