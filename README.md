@@ -15,7 +15,7 @@ Admin-only commands:
 - `/stop` — stop the active job for everyone; the current Gemini request is allowed to finish first.
 
 ## Queue and output behavior
-- Upload up to 12 SRT/ASS/SSA files, or a ZIP containing up to 12 subtitle files.
+- Upload up to 100 SRT/ASS/SSA files in one queue, or a ZIP containing up to 100 subtitle files.
 - The queue updates in one message. The blue **▶️ Start Translation** button starts the job; the red **❌ Cancel Queue** button clears an unstarted queue.
 - An unstarted queue is cleared after 3 minutes without activity.
 - Each finished file is sent immediately; processing does not wait for all files in the queue.

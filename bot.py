@@ -538,13 +538,22 @@ class SubtitleBot:
             await message.reply_text("⏳ A subtitle job is currently running. Please wait until it finishes.")
             return
         await message.reply_text(
-            "✨ *Welcome to Sinhala Subtitle Bot!*\n\n"
-            "🎬 Translate subtitles from any language into natural Sinhala.\n"
-            "📂 Upload SRT, ASS, SSA, or a ZIP containing subtitle files.\n"
-            "📦 Add up to 12 files, then press *▶️ Start Translation*.\n"
-            "⚡ Completed files are sent as soon as they are ready, followed by one ZIP.\n\n"
-            "Use /help to see commands and options.",
-            parse_mode="Markdown",
+            "✨ <b>𝐖𝐄𝐋𝐂𝐎𝐌𝐄</b> ✨\n\n"
+            "<pre>       𝙱𝙰𝙱𝚈 𝟻</pre>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "🎬 <b>𝐒𝐈𝐍𝐇𝐀𝐋𝐀 𝐒𝐔𝐁𝐓𝐈𝐓𝐋𝐄 𝐓𝐑𝐀𝐍𝐒𝐋𝐀𝐓𝐎𝐑</b>\n\n"
+            "🌍 Translate your favourite subtitles into natural Sinhala with AI.\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "📂 <b>SUPPORTED FORMATS</b>\n\n"
+            "<code>SRT</code> • <code>ASS</code> • <code>SSA</code> • <code>ZIP</code>\n\n"
+            "📦 <b>QUEUE CAPACITY</b>\n\n"
+            "<code>UP TO 100 FILES</code>\n\n"
+            "⚡ <b>FAST • SMART • NATURAL</b>\n\n"
+            "Upload your files and let Baby 5 do the magic!\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "💡 Type /help to explore all features.\n\n"
+            "❤️ <b>MADE FOR SINHALA ANIME FANS</b>",
+            parse_mode="HTML",
         )
         if self.state.pending:
             await self._send_queue_keyboard(update.effective_chat.id)
@@ -554,7 +563,7 @@ class SubtitleBot:
             "✨ *BABY 5 — Sinhala Subtitle Bot*\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             "📤 *How to translate*\n"
-            "1️⃣ Upload SRT, ASS, SSA, or a ZIP with subtitle files (up to 12 files).\n"
+            "1️⃣ Upload SRT, ASS, SSA, or a ZIP with subtitle files (up to 100 files per queue).\n"
             "2️⃣ Press *▶️ Start Translation* in the queue.\n"
             "3️⃣ Each finished subtitle is sent right away; one ZIP follows when all finish.\n"
             "⏳ An unstarted queue is cleared after 3 minutes.\n\n"
@@ -1179,19 +1188,76 @@ class SubtitleBot:
         )
 
     async def _execute_broadcast(self, update: Update, source_chat: int, source_message: int) -> None:
-        targets=self._registered_user_ids()
-        ok=0; failed=0
+        targets = self._registered_user_ids()
+        ok = 0
+        failed_ids: list[int] = []
+
         for target in targets:
             try:
-                await self.application.bot.copy_message(chat_id=target,from_chat_id=source_chat,message_id=source_message)
-                ok+=1
+                await self.application.bot.copy_message(
+                    chat_id=target,
+                    from_chat_id=source_chat,
+                    message_id=source_message,
+                )
+                ok += 1
                 await asyncio.sleep(0.04)
-            except Exception:
-                failed+=1
+            except Exception as exc:
+                failed_ids.append(target)
+                print(
+                    f"[BROADCAST DELIVERY FAILED] user_id={target} "
+                    f"{type(exc).__name__}: {str(exc)[:200]}",
+                    flush=True,
+                )
+
         msg = self._message(update)
         if msg:
-            await msg.reply_text(f"Broadcast finished. Delivered: {ok}. Failed: {failed}.")
-        await self._log_admin_action(update,f"Broadcast delivered to {ok}; failed {failed}")
+            failed_lines: list[str] = []
+            if failed_ids:
+                with self._db() as db:
+                    rows = db.execute(
+                        "SELECT user_id, username, full_name FROM users"
+                    ).fetchall()
+                user_details = {int(row["user_id"]): row for row in rows}
+                for user_id in failed_ids:
+                    row = user_details.get(user_id)
+                    if row:
+                        name = " ".join(str(row["full_name"] or "").split()) or "Unknown"
+                        username = " ".join(str(row["username"] or "").split())
+                    else:
+                        name = "Unknown"
+                        username = ""
+                    name = name[:80]
+                    username_part = f" (@{username[:50]})" if username else ""
+                    failed_lines.append(f"• {name}{username_part} — ID: {user_id}")
+
+            header = (
+                "📢 BABY 5 — BROADCAST REPORT\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"✅ Successful: {ok}\n"
+                f"❌ Failed: {len(failed_ids)}\n"
+            )
+            if failed_lines:
+                report = header + "\n❌ FAILED USERS\n" + "\n".join(failed_lines)
+            else:
+                report = header + "\n🎉 All messages were delivered successfully!"
+
+            chunks: list[str] = []
+            current = ""
+            for line in report.splitlines(keepends=True):
+                if current and len(current) + len(line) > 3500:
+                    chunks.append(current.rstrip())
+                    current = ""
+                current += line
+            if current:
+                chunks.append(current.rstrip())
+
+            for chunk in chunks:
+                await msg.reply_text(chunk)
+
+        await self._log_admin_action(
+            update,
+            f"Broadcast delivered to {ok}; failed {len(failed_ids)}",
+        )
 
     async def admin_media_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if context.user_data.get("admin_prompt") == "broadcast" and self.is_admin(update):
@@ -1506,7 +1572,7 @@ class SubtitleBot:
             + (
                 "✅ Ready — press Start Translation when all files are uploaded."
                 if names else
-                "📤 Upload 1–12 subtitle files. This message updates automatically."
+                "📤 Upload up to 100 subtitle files. This message updates automatically."
             )
         )
         buttons = []
@@ -2243,6 +2309,10 @@ def build_application(settings: Settings) -> Application:
     app = (
         Application.builder()
         .token(settings.bot_token)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
         .get_updates_connect_timeout(30.0)
         .get_updates_read_timeout(30.0)
         .get_updates_write_timeout(30.0)

@@ -29,3 +29,12 @@ FOLLOW-UP FIX — OWNER PRIVACY, PROGRESS BAR, SPOKEN SINHALA
 - Progress bar now uses a Telegram Markdown fenced code block, so the three backticks are formatting syntax and are not visible in the rendered message.
 - Strengthened the Sinhala prompt to select “උඹ” for rough/close/hostile dialogue when context warrants it, retain “ඔයා” for friendly/respectful speech, and prefer natural phrases such as “පොළොව හෙල්ලෙනවා” over literal/bookish wording.
 - Reviewed the 12 SRT files in the supplied Chainsaw Man Season 1 reference ZIP for pronoun/register patterns.
+
+
+BABY 5 UPDATE — QUEUE, BROADCAST REPORT & WELCOME MESSAGE
+- Increased the queue capacity to 100 subtitle files.
+- ZIP archives can contain up to 100 subtitle files (subject to the existing uncompressed-size limit).
+- Updated /start and /help text to show the 100-file queue capacity.
+- Redesigned /start welcome message using Telegram HTML formatting.
+- Broadcast completion report now includes the names, usernames (when available), and Telegram IDs of users whose delivery failed. Long reports are split into multiple Telegram messages.
+- Preserved the 30-second Telegram Bot API request timeouts, including getFile requests.

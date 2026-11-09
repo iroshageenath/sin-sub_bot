@@ -47,9 +47,9 @@ class Settings:
     models: tuple[str, ...]
     default_model: str
 
-    max_files: int = 12
+    max_files: int = 100
     max_download_mb: int = 20
-    max_zip_members: int = 12
+    max_zip_members: int = 100
     max_zip_uncompressed_mb: int = 250
     max_entries_per_call: int = 50
     max_chars_per_call: int = 12000
@@ -115,9 +115,9 @@ class Settings:
             gemini_keys=tuple(keys),
             models=models,
             default_model=default_model,
-            max_files=max(1, int(os.getenv("MAX_FILES", "12"))),
+            max_files=max(1, int(os.getenv("MAX_FILES", "100"))),
             max_download_mb=max(1, int(os.getenv("MAX_DOWNLOAD_MB", "20"))),
-            max_zip_members=max(1, int(os.getenv("MAX_ZIP_MEMBERS", "12"))),
+            max_zip_members=max(1, int(os.getenv("MAX_ZIP_MEMBERS", "100"))),
             max_zip_uncompressed_mb=max(10, int(os.getenv("MAX_ZIP_UNCOMPRESSED_MB", "250"))),
             max_entries_per_call=max(1, int(os.getenv("MAX_ENTRIES_PER_CALL", "50"))),
             max_chars_per_call=max(2000, int(os.getenv("MAX_CHARS_PER_CALL", "12000"))),
