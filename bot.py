@@ -137,6 +137,8 @@ class SubtitleBot:
         self.work_root.mkdir(parents=True, exist_ok=True)
         self.application: Application | None = None
         self.state_lock = asyncio.Lock()
+        # Serialize queue mutations while allowing commands to be handled concurrently.
+        self.upload_lock = asyncio.Lock()
         self.db_path = settings.data_dir / "baby5_admin.sqlite3"
         self._init_db()
 
@@ -585,7 +587,19 @@ class SubtitleBot:
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         st = self.state
         if not st.processing:
-            await self._message(update).reply_text("📊 BABY 5 STATUS\n\n🟢 No active translation job right now.")
+            if st.pending or st.owner_id is not None:
+                await self._message(update).reply_text(
+                    "📦 <b>BABY 5 · QUEUE STATUS</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 Queue owner ID: <code>{st.owner_id or 0}</code>\n"
+                    f"📁 Files waiting: <b>{len(st.pending)}/{self.s.max_files}</b>\n"
+                    f"📦 Batch size: <b>{st.batch_size}</b> lines\n"
+                    "🟡 Status: <b>Waiting to start</b>\n\n"
+                    "▶️ Press <b>Start Translation</b> in your queue message to begin.",
+                    parse_mode="HTML",
+                )
+            else:
+                await self._message(update).reply_text("📊 BABY 5 STATUS\n\n🟢 No active translation job right now.")
             return
         total = max(int(st.total_lines or 0), 1)
         done = min(st.translated_successes + st.failed_subtitles, total)
@@ -1268,6 +1282,11 @@ class SubtitleBot:
     # ------------------------------------------------------------------
 
     async def document_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Keep uploads ordered; concurrent update processing lets commands run meanwhile.
+        async with self.upload_lock:
+            await self._document_handler_locked(update, context)
+
+    async def _document_handler_locked(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = self._message(update)
         user = update.effective_user
         if not message or not user or not message.document:
@@ -1387,6 +1406,11 @@ class SubtitleBot:
     # ------------------------------------------------------------------
 
     async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Prevent Start/Cancel callbacks from racing an upload that is changing the queue.
+        async with self.upload_lock:
+            await self._callback_handler_locked(update, context)
+
+    async def _callback_handler_locked(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         if not query:
             return
@@ -1532,6 +1556,9 @@ class SubtitleBot:
                     InlineKeyboardButton("🔴 Stop", callback_data="stop_job")
                 ]])
             )
+            # Claim the active-job state before yielding to the event loop so
+            # /status and other users cannot observe a false idle/busy mismatch.
+            self.state.processing = True
             self.state.task = asyncio.create_task(
                 self._process_job(query.message.chat_id)
             )
@@ -1558,13 +1585,18 @@ class SubtitleBot:
         if not self.application:
             return
         names = [pf.original_name for pf in self.state.pending]
+        # Telegram text messages are limited to 4096 characters. Showing all 100
+        # filenames can exceed that limit and leave the queue claimed but invisible.
         visible = []
-        for i, name in enumerate(names, start=1):
-            clean = name.replace("\n", " ")
-            if len(clean) > 64:
-                clean = clean[:61] + "…"
+        for i, filename in enumerate(names[:10], start=1):
+            clean = " ".join(str(filename).replace("\r", " ").replace("\n", " ").split())
+            if len(clean) > 48:
+                clean = clean[:45] + "…"
             visible.append(f"{i}. {clean}")
         listing = "\n".join(visible) if visible else "(no files yet)"
+        remaining = max(0, len(names) - len(visible))
+        if remaining:
+            listing += f"\n… and {remaining} more file(s)"
         full = (
             f"📦 Queue: {len(names)}/{self.s.max_files}\n"
             f"⚙️ Mode: Translate to Sinhala\n🎚️ Batch: {self.state.batch_size} lines\n\n"
@@ -1572,7 +1604,7 @@ class SubtitleBot:
             + (
                 "✅ Ready — press Start Translation when all files are uploaded."
                 if names else
-                "📤 Upload up to 100 subtitle files. This message updates automatically."
+                f"📤 Upload up to {self.s.max_files} subtitle files. This message updates automatically."
             )
         )
         buttons = []
@@ -2309,6 +2341,7 @@ def build_application(settings: Settings) -> Application:
     app = (
         Application.builder()
         .token(settings.bot_token)
+        .concurrent_updates(16)
         .connect_timeout(30.0)
         .read_timeout(30.0)
         .write_timeout(30.0)

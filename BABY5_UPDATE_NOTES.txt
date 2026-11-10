@@ -38,3 +38,8 @@ BABY 5 UPDATE — QUEUE, BROADCAST REPORT & WELCOME MESSAGE
 - Redesigned /start welcome message using Telegram HTML formatting.
 - Broadcast completion report now includes the names, usernames (when available), and Telegram IDs of users whose delivery failed. Long reports are split into multiple Telegram messages.
 - Preserved the 30-second Telegram Bot API request timeouts, including getFile requests.
+
+Queue and status reliability fix:
+- Queue message now displays only the first 10 filenames and a count of the remaining files, preventing Telegram's 4096-character message limit from rejecting large queues.
+- /status now reports a waiting queue and its owner/file count when files are queued but translation has not started.
+- Active-job state is claimed before the translation task is scheduled, avoiding a brief false-idle status window.
